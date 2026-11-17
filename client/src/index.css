@@ -1594,11 +1594,32 @@ a:hover {
   max-width: 100%;
 }
 
+.capacity-inputs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 210px;
+}
+
+.capacity-field {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  min-width: 110px;
+  flex: 1;
+}
+
+.capacity-field label {
+  white-space: normal;
+}
+
+.capacity-field .form-input {
+  width: 100%;
+}
+
 .slots-hero-note {
   margin-top: var(--space-md);
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
+  display: block;
   padding: 8px 12px;
   border: 1px solid rgba(99, 128, 185, 0.18);
   border-radius: var(--radius-md);
@@ -2101,4 +2122,43 @@ a:hover {
   .slots-table td:nth-child(8) {
     text-align: left;
   }
+}
+.date-input {
+  position: relative;
+  display: inline-block;
+  width: 100%;
+  min-width: 140px;
+}
+
+.date-input > .form-input {
+  width: 100%;
+  padding-right: 34px;
+}
+
+.date-input > input[aria-invalid="true"] {
+  border-color: var(--danger, #ef4444);
+}
+
+.date-input-calendar {
+  position: absolute;
+  right: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  color: var(--text-muted);
+}
+
+.date-input-picker {
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: 32px;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.date-input:focus-within {
+  outline: 1px solid var(--accent, #818cf8);
+  border-radius: 6px;
 }

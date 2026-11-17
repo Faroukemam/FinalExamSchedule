@@ -1,26 +1,23 @@
-function pad2(value) {
-    return String(value).padStart(2, '0');
-}
+const { normalizeSlotDate } = require('./slotImport');
 
 function normalizeExamDate(value) {
-    const raw = String(value || '').trim();
-    if (!raw) return '';
-
-    if (raw.includes('/')) {
-        const [year, day, month] = raw.split('/').map(part => part.trim());
-        if (year && day && month) {
-            return `${year}-${pad2(month)}-${pad2(day)}`;
-        }
+    if (value === undefined || value === null || String(value).trim() === '') return '';
+    try {
+        return normalizeSlotDate(value);
+    } catch (error) {
+        error.status = 400;
+        throw error;
     }
-
-    if (raw.includes('-')) {
-        const [year, month, day] = raw.split('-').map(part => part.trim());
-        if (year && month && day) {
-            return `${year}-${pad2(month)}-${pad2(day)}`;
-        }
-    }
-
-    return raw;
 }
 
-module.exports = { normalizeExamDate };
+function formatExamDateDisplay(value) {
+    const raw = String(value ?? '').trim();
+    try {
+        const [year, month, day] = normalizeExamDate(raw).split('-');
+        return year ? `${day}/${month}/${year}` : '';
+    } catch {
+        return raw;
+    }
+}
+
+module.exports = { normalizeExamDate, formatExamDateDisplay };

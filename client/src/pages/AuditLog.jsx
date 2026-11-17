@@ -1,3 +1,4 @@
+import { formatDateTimeDisplay, formatDatesInText } from '../utils/date'
 import { useState, useEffect } from 'react'
 import { api } from '../api'
 import { icons, useToast } from '../App'
@@ -59,7 +60,7 @@ export default function AuditLog() {
                                 <tr><td colSpan="6" className="text-center text-muted" style={{ padding: 40 }}>No audit entries</td></tr>
                             ) : logs.map(log => (
                                 <tr key={log.id}>
-                                    <td className="text-sm">{log.timestamp}</td>
+                                    <td className="text-sm">{formatDateTimeDisplay(log.timestamp)}</td>
                                     <td>{log.user_name || 'System'}</td>
                                     <td>{actionBadge(log.action)}</td>
                                     <td><strong>{log.subject_code}</strong></td>

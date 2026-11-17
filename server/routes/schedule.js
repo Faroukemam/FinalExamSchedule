@@ -3,6 +3,8 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { normalizeExamDate } = require('../utils/date');
 const { buildAllocatedScheduleEntries } = require('../utils/scheduleAllocation');
+const { capForType, withCapacityTransaction } = require('../utils/capacity');
+const { allocatePools } = require('../utils/poolAllocation');
 const router = express.Router();
 
 function resultToObjects(result) {
@@ -87,12 +89,6 @@ function conflictScoreFromBreakdown(breakdown) {
     );
 }
 
-function maxAllowedForCap(capValue) {
-    const cap = Number(capValue);
-    if (!Number.isFinite(cap) || cap <= 0) return Infinity;
-    return Math.floor(cap);
-}
-
 function runOrToolsAutoSchedule(payload) {
     const scriptPath = path.join(__dirname, '..', 'scripts', 'auto_schedule_ortools.py');
     const pythonCommands = [
@@ -145,7 +141,8 @@ function heuristicAutoSchedule({ units, periods, studentSubjects, currentSchedul
     for (const entry of currentSchedule) {
         if (!periodSubjects[entry.period_id]) periodSubjects[entry.period_id] = [];
         periodSubjects[entry.period_id].push(entry.subject_code);
-        periodStudents[entry.period_id] = (periodStudents[entry.period_id] || 0) + (Number(entry.student_count) || 0);
+        const usage = periodStudents[entry.period_id] ||= {};
+        usage[entry.subject_code] = (usage[entry.subject_code] || 0) + (Number(entry.student_count) || 0);
         for (const sid of entry.assigned_student_ids || []) {
             const studentId = String(sid);
             if (!studentDayCounts[studentId]) studentDayCounts[studentId] = {};
@@ -164,8 +161,7 @@ function heuristicAutoSchedule({ units, periods, studentSubjects, currentSchedul
         const eligiblePeriods = periods.filter(p =>
             unit.eligible_period_ids.includes(Number(p.id))
         ).filter(p => {
-            const maxAllowed = maxAllowedForCap(p.student_cap);
-            if (((periodStudents[p.id] || 0) + (Number(unit.student_count) || 0)) > maxAllowed) {
+            if (!allocatePools(p, { ...periodStudents[p.id], ...unit.subject_counts }).ok) {
                 return false;
             }
             return enrolledStudents.every(sid => ((studentDayCounts[String(sid)]?.[p.exam_date] || 0) < 2));
@@ -175,7 +171,7 @@ function heuristicAutoSchedule({ units, periods, studentSubjects, currentSchedul
             for (const subjectCode of unit.subject_codes) {
                 failed.push({
                     subject_code: subjectCode,
-                    reason: `No period matches exact required duration (${requiredDuration} min)`
+                    reason: 'No eligible slot has enough Minor/Major capacity and remaining daily exam allowance'
                 });
             }
             continue;
@@ -218,15 +214,10 @@ function heuristicAutoSchedule({ units, periods, studentSubjects, currentSchedul
             }
 
             const conflicts = conflictScoreFromBreakdown(breakdownTotals);
-            const periodCap = Number(period.student_cap);
-            const overflow = Number.isFinite(periodCap) && periodCap > 0
-                ? Math.max(0, ((periodStudents[period.id] || 0) + (Number(unit.student_count) || 0)) - periodCap)
-                : 0;
-            const utilization = Number.isFinite(periodCap) && periodCap > 0
-                ? ((periodStudents[period.id] || 0) + (Number(unit.student_count) || 0)) / periodCap
-                : ((periodStudents[period.id] || 0) + (Number(unit.student_count) || 0));
+            const allocation = allocatePools(period, { ...periodStudents[period.id], ...unit.subject_counts });
+            const utilization = allocation.usage.major + allocation.usage.minor;
             const earlyDayPenalty = (dayRankByDate[String(period.exam_date || '')] || 0) * sizeBucket;
-            const totalScore = conflicts + (overflow * CONFLICT_WEIGHTS.capacity_overflow) + earlyDayPenalty;
+            const totalScore = conflicts + earlyDayPenalty;
 
             if (totalScore < minConflicts || (totalScore === minConflicts && utilization < bestUtilization)) {
                 minConflicts = totalScore;
@@ -251,7 +242,7 @@ function heuristicAutoSchedule({ units, periods, studentSubjects, currentSchedul
 
         if (!periodSubjects[bestPeriod.id]) periodSubjects[bestPeriod.id] = [];
         periodSubjects[bestPeriod.id].push(...unit.subject_codes);
-        periodStudents[bestPeriod.id] = (periodStudents[bestPeriod.id] || 0) + (Number(unit.student_count) || 0);
+        periodStudents[bestPeriod.id] = { ...periodStudents[bestPeriod.id], ...unit.subject_counts };
         for (const sid of enrolledStudents) {
             const studentId = String(sid);
             if (!studentDayCounts[studentId]) studentDayCounts[studentId] = {};
@@ -353,6 +344,10 @@ function buildAutoScheduleUnits({ unscheduled, periods, registrations, currentSc
 
         let eligiblePeriods = periods.filter(period =>
             periodDurationMinutes(period.start_time, period.end_time) === requiredDurations[0]
+        ).filter(period =>
+            unitCodes.every(subjectCode => (registrationsBySubject[subjectCode]?.size || 0) <= capForType(period, 'subject'))
+        ).filter(period =>
+            unitCodes.every(subjectCode => (registrationsBySubject[subjectCode]?.size || 0) <= Math.max(capForType(period, 'major'), capForType(period, 'minor')))
         );
 
         const scheduledGroupMembers = group
@@ -373,12 +368,14 @@ function buildAutoScheduleUnits({ unscheduled, periods, registrations, currentSc
         }
 
         if (eligiblePeriods.length === 0) {
-            failSubjects(unitCodes, `No period matches exact required duration (${requiredDurations[0]} min)`);
+            failSubjects(unitCodes, `No eligible slot matches duration (${requiredDurations[0]} min), group placement, per-subject limit and whole-subject pool capacity`);
             continue;
         }
 
         const studentIds = new Set();
+        const subjectCounts = {};
         for (const unitCode of unitCodes) {
+            subjectCounts[unitCode] = registrationsBySubject[unitCode]?.size || 0;
             for (const studentId of registrationsBySubject[unitCode] || []) {
                 studentIds.add(studentId);
             }
@@ -391,6 +388,7 @@ function buildAutoScheduleUnits({ unscheduled, periods, registrations, currentSc
             subject_codes: unitCodes,
             required_duration: requiredDurations[0],
             student_count: unitSubjects.reduce((sum, item) => sum + (Number(item.student_count) || 0), 0),
+            subject_counts: subjectCounts,
             eligible_period_ids: eligiblePeriods.map(period => Number(period.id)),
             enrolled_students: [...studentIds]
         });
@@ -408,7 +406,7 @@ router.get('/', (req, res) => {
             return publicRow;
         }));
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -450,56 +448,55 @@ router.post('/assign', (req, res) => {
             return res.status(400).json({ error: 'Subjects in a same-period group cannot use Add Period. Move the whole group instead.' });
         }
 
-        if (allowMultiExam && assignMode === 'add') {
-            const targets = targetProgramsNormalized.length > 0
-                ? targetProgramsNormalized
-                : [targetProgramNormalized];
-            const normalizedTargets = targets.length > 0 ? targets : [''];
+        withCapacityTransaction(db, () => {
+            if (allowMultiExam && assignMode === 'add') {
+                const targets = targetProgramsNormalized.length > 0
+                    ? targetProgramsNormalized
+                    : [targetProgramNormalized];
+                const normalizedTargets = targets.length > 0 ? targets : [''];
 
-            let inserted = 0;
-            for (const tp of normalizedTargets) {
-                const existingInPeriod = db.exec(
-                    `SELECT id FROM schedule WHERE subject_code = ? AND exam_period_id = ? AND COALESCE(target_program, '') = ?`,
-                    [subject_code, exam_period_id, tp]
-                );
-                if (existingInPeriod.length && existingInPeriod[0].values.length) {
-                    continue;
+                let inserted = 0;
+                for (const tp of normalizedTargets) {
+                    const existingInPeriod = db.exec(
+                        `SELECT id FROM schedule WHERE subject_code = ? AND exam_period_id = ? AND COALESCE(target_program, '') = ?`,
+                        [subject_code, exam_period_id, tp]
+                    );
+                    if (existingInPeriod.length && existingInPeriod[0].values.length) {
+                        continue;
+                    }
+                    db.run(`INSERT INTO schedule (exam_period_id, subject_code, target_program) VALUES (?, ?, ?)`,
+                        [exam_period_id, subject_code, tp]);
+                    inserted++;
                 }
-                db.run(`INSERT INTO schedule (exam_period_id, subject_code, target_program) VALUES (?, ?, ?)`,
-                    [exam_period_id, subject_code, tp]);
-                inserted++;
-            }
 
-            if (inserted === 0) {
-                return res.status(400).json({ error: 'Subject already assigned to this period for all selected program targets' });
-            }
-
-            const targetLabel = normalizedTargets.map(tp => tp || 'ALL').join(', ');
-            db.run(`INSERT INTO audit_log (action, subject_code, old_value, new_value) VALUES (?, ?, ?, ?)`,
-                ['schedule_assign_additional', subject_code, 'period_added', `${periodValue} [${targetLabel}]`]);
-        } else {
-            // Default behavior: keep exactly one period per subject.
-            let changed = false;
-            for (const code of assignmentCodes) {
-                const existing = db.exec(`SELECT id FROM schedule WHERE subject_code = ? AND exam_period_id = ? AND COALESCE(target_program, '') = ''`, [code, exam_period_id]);
-                if (!existing.length || !existing[0].values.length) {
-                    db.run(`DELETE FROM schedule WHERE subject_code = ?`, [code]);
-                    db.run(`INSERT INTO schedule (exam_period_id, subject_code, target_program) VALUES (?, ?, '')`, [exam_period_id, code]);
-                    changed = true;
+                if (inserted === 0) {
+                    const error = new Error('Subject already assigned to this period for all selected program targets');
+                    error.status = 400;
+                    throw error;
                 }
-                db.run(`UPDATE subjects SET status = 'scheduled' WHERE subject_code = ?`, [code]);
+
+                const targetLabel = normalizedTargets.map(tp => tp || 'ALL').join(', ');
+                db.run(`INSERT INTO audit_log (action, subject_code, old_value, new_value) VALUES (?, ?, ?, ?)`,
+                    ['schedule_assign_additional', subject_code, 'period_added', `${periodValue} [${targetLabel}]`]);
+            } else {
+                // Default behavior: keep exactly one period per subject.
+                for (const code of assignmentCodes) {
+                    const existing = db.exec(`SELECT id FROM schedule WHERE subject_code = ? AND exam_period_id = ? AND COALESCE(target_program, '') = ''`, [code, exam_period_id]);
+                    if (!existing.length || !existing[0].values.length) {
+                        db.run(`DELETE FROM schedule WHERE subject_code = ?`, [code]);
+                        db.run(`INSERT INTO schedule (exam_period_id, subject_code, target_program) VALUES (?, ?, '')`, [exam_period_id, code]);
+                    }
+                    db.run(`UPDATE subjects SET status = 'scheduled' WHERE subject_code = ?`, [code]);
+                }
+                db.run(`INSERT INTO audit_log (action, subject_code, old_value, new_value) VALUES (?, ?, ?, ?)`,
+                    ['schedule_move', assignmentCodes.join(','), 'reassigned', periodValue]);
             }
-            db.run(`INSERT INTO audit_log (action, subject_code, old_value, new_value) VALUES (?, ?, ?, ?)`,
-                ['schedule_move', assignmentCodes.join(','), 'reassigned', periodValue]);
-            if (!changed) {
-                return res.json({ success: true });
-            }
-        }
+        }, [], { enforcePoolCaps: false }); // Manual placement may exceed period pools; per-subject limits still apply.
 
         db.saveToFile();
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -531,7 +528,7 @@ router.delete('/unassign/:subject_code', (req, res) => {
         db.saveToFile();
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -558,20 +555,23 @@ router.post('/import', (req, res) => {
                 // Strip CRN if present
                 const subjectCode = code.indexOf('-') > 0 ? code.substring(0, code.indexOf('-')).trim() : code;
 
-                // Ensure period exists
-                db.run(`INSERT OR IGNORE INTO exam_periods (exam_date, start_time, end_time) VALUES (?, ?, ?)`, [date, start, end]);
-                const periodResult = db.exec(`SELECT id FROM exam_periods WHERE exam_date=? AND start_time=? AND end_time=?`, [date, start, end]);
+                assigned += withCapacityTransaction(db, () => {
+                    // Ensure period exists
+                    db.run(`INSERT OR IGNORE INTO exam_periods (exam_date, start_time, end_time) VALUES (?, ?, ?)`, [date, start, end]);
+                    const periodResult = db.exec(`SELECT id FROM exam_periods WHERE exam_date=? AND start_time=? AND end_time=?`, [date, start, end]);
 
-                if (periodResult.length && periodResult[0].values.length) {
-                    const periodId = periodResult[0].values[0][0];
-                    // Ensure subject exists
-                    db.run(`INSERT OR IGNORE INTO subjects (subject_code) VALUES (?)`, [subjectCode]);
-                    // Assign to a single period only
-                    db.run(`DELETE FROM schedule WHERE subject_code = ?`, [subjectCode]);
-                    db.run(`INSERT INTO schedule (exam_period_id, subject_code, target_program) VALUES (?, ?, '')`, [periodId, subjectCode]);
-                    db.run(`UPDATE subjects SET status = 'scheduled' WHERE subject_code = ?`, [subjectCode]);
-                    assigned++;
-                }
+                    if (periodResult.length && periodResult[0].values.length) {
+                        const periodId = periodResult[0].values[0][0];
+                        // Ensure subject exists
+                        db.run(`INSERT OR IGNORE INTO subjects (subject_code) VALUES (?)`, [subjectCode]);
+                        // Assign to a single period only
+                        db.run(`DELETE FROM schedule WHERE subject_code = ?`, [subjectCode]);
+                        db.run(`INSERT INTO schedule (exam_period_id, subject_code, target_program) VALUES (?, ?, '')`, [periodId, subjectCode]);
+                        db.run(`UPDATE subjects SET status = 'scheduled' WHERE subject_code = ?`, [subjectCode]);
+                        return 1;
+                    }
+                    return 0;
+                });
             } catch (rowErr) {
                 errors.push(rowErr.message);
             }
@@ -580,7 +580,7 @@ router.post('/import', (req, res) => {
         db.saveToFile();
         res.json({ success: true, assigned, errors: errors.slice(0, 20) });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -654,7 +654,8 @@ router.post('/auto-schedule', (req, res) => {
             }
             const prospectiveStudentsByPeriod = {};
             for (const row of currentSchedule) {
-                prospectiveStudentsByPeriod[row.period_id] = (prospectiveStudentsByPeriod[row.period_id] || 0) + (Number(row.student_count) || 0);
+                const usage = prospectiveStudentsByPeriod[row.period_id] ||= {};
+                usage[row.subject_code] = (usage[row.subject_code] || 0) + Number(row.student_count || 0);
             }
             const periodById = Object.fromEntries(periods.map(period => [Number(period.id), period]));
             const placed = [];
@@ -662,47 +663,49 @@ router.post('/auto-schedule', (req, res) => {
                 const subjectCodes = Array.isArray(item.subject_codes) ? item.subject_codes : [item.subject_code].filter(Boolean);
                 return subjectCodes.map(code => ({ subject_code: code, reason: item.reason || 'Solver failed to place grouped subjects' }));
             }) : []);
-            for (const assignment of solverResult.placed || []) {
-                const subjectCodes = Array.isArray(assignment.subject_codes) ? assignment.subject_codes : [assignment.subject_code];
-                const primaryCode = subjectCodes[0];
-                const unit = unitBySubjectCode[primaryCode];
-                const periodId = Number(assignment.exam_period_id);
-                const period = periodById[periodId];
-                const maxAllowed = maxAllowedForCap(period?.student_cap);
-                const nextTotal = (prospectiveStudentsByPeriod[periodId] || 0) + (Number(unit?.student_count) || 0);
-                if (nextTotal > maxAllowed) {
+            withCapacityTransaction(db, () => {
+                for (const assignment of solverResult.placed || []) {
+                    const subjectCodes = Array.isArray(assignment.subject_codes) ? assignment.subject_codes : [assignment.subject_code];
+                    const primaryCode = subjectCodes[0];
+                    const unit = unitBySubjectCode[primaryCode];
+                    const periodId = Number(assignment.exam_period_id);
+                    const period = periodById[periodId];
+                    if (!unit || !period || !unit.eligible_period_ids.includes(periodId)) throw new Error('Solver returned an invalid assignment');
+                    const nextSubjects = { ...prospectiveStudentsByPeriod[periodId], ...unit.subject_counts };
+                    if (!allocatePools(period, nextSubjects).ok) {
+                        for (const code of subjectCodes) {
+                            failed.push({
+                                subject_code: code,
+                                reason: `No whole-subject Major/Minor allocation fits ${period.exam_date}`
+                            });
+                        }
+                        continue;
+                    }
+                    prospectiveStudentsByPeriod[periodId] = nextSubjects;
                     for (const code of subjectCodes) {
-                        failed.push({
+                        db.run(`DELETE FROM schedule WHERE subject_code = ?`, [code]);
+                        db.run(`INSERT INTO schedule (exam_period_id, subject_code, target_program) VALUES (?, ?, '')`,
+                            [assignment.exam_period_id, code]);
+                        db.run(`UPDATE subjects SET status = 'scheduled' WHERE subject_code = ?`, [code]);
+                        placed.push({
                             subject_code: code,
-                            reason: `Slot cap limit exceeded for ${period?.exam_date || 'selected slot'}`
+                            exam_period_id: periodId,
+                            period: assignment.period,
+                            required_duration: assignment.required_duration
                         });
                     }
-                    continue;
                 }
-                prospectiveStudentsByPeriod[periodId] = nextTotal;
-                for (const code of subjectCodes) {
-                    db.run(`DELETE FROM schedule WHERE subject_code = ?`, [code]);
-                    db.run(`INSERT INTO schedule (exam_period_id, subject_code, target_program) VALUES (?, ?, '')`,
-                        [assignment.exam_period_id, code]);
-                    db.run(`UPDATE subjects SET status = 'scheduled' WHERE subject_code = ?`, [code]);
-                    placed.push({
-                        subject_code: code,
-                        exam_period_id: periodId,
-                        period: assignment.period,
-                        required_duration: assignment.required_duration
-                    });
-                }
-            }
+            });
             scheduleResult = { placed, failed, solver: 'or-tools' };
         } catch (solverErr) {
-            scheduleResult = heuristicAutoSchedule({
+            scheduleResult = withCapacityTransaction(db, () => heuristicAutoSchedule({
                 units,
                 periods,
                 studentSubjects,
                 currentSchedule,
                 db,
                 backToBackMode
-            });
+            }));
             scheduleResult.failed = preFailed.concat(scheduleResult.failed || []);
             scheduleResult.warning = `OR-Tools fallback: ${solverErr.message}`;
         }
@@ -717,7 +720,7 @@ router.post('/auto-schedule', (req, res) => {
             warning: scheduleResult.warning || null
         });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -734,24 +737,26 @@ router.delete('/unassign-entry/:id', (req, res) => {
         const groupedSubjectCodes = getGroupedSubjectCodes(db, subjectCode);
         const unassignCodes = groupedSubjectCodes.length > 0 ? groupedSubjectCodes : [subjectCode];
 
-        if (groupedSubjectCodes.length > 0) {
-            for (const code of unassignCodes) {
-                db.run(`DELETE FROM schedule WHERE subject_code = ?`, [code]);
-                db.run(`UPDATE subjects SET status = 'unscheduled' WHERE subject_code = ? AND status = 'scheduled'`, [code]);
-            }
-        } else {
-            db.run(`DELETE FROM schedule WHERE id = ?`, [id]);
+        withCapacityTransaction(db, () => {
+            if (groupedSubjectCodes.length > 0) {
+                for (const code of unassignCodes) {
+                    db.run(`DELETE FROM schedule WHERE subject_code = ?`, [code]);
+                    db.run(`UPDATE subjects SET status = 'unscheduled' WHERE subject_code = ? AND status = 'scheduled'`, [code]);
+                }
+            } else {
+                db.run(`DELETE FROM schedule WHERE id = ?`, [id]);
 
-            const remaining = db.exec(`SELECT COUNT(*) as c FROM schedule WHERE subject_code = ?`, [subjectCode]);
-            if (!remaining.length || remaining[0].values[0][0] === 0) {
-                db.run(`UPDATE subjects SET status = 'unscheduled' WHERE subject_code = ? AND status = 'scheduled'`, [subjectCode]);
+                const remaining = db.exec(`SELECT COUNT(*) as c FROM schedule WHERE subject_code = ?`, [subjectCode]);
+                if (!remaining.length || remaining[0].values[0][0] === 0) {
+                    db.run(`UPDATE subjects SET status = 'unscheduled' WHERE subject_code = ? AND status = 'scheduled'`, [subjectCode]);
+                }
             }
-        }
 
+        }, [], { enforcePoolCaps: false });
         db.saveToFile();
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -770,7 +775,7 @@ router.delete('/clear-all', (req, res) => {
         db.saveToFile();
         res.json({ success: true, cleared: total });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 

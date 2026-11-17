@@ -82,6 +82,7 @@ async function initDB() {
     program TEXT DEFAULT '',
     level TEXT DEFAULT '',
     room_placement_type TEXT DEFAULT 'TH' CHECK(room_placement_type IN ('TH','LAB','DH')),
+    capacity_type TEXT NOT NULL DEFAULT 'major' CHECK(capacity_type IN ('major', 'minor')),
     exam_duration INTEGER DEFAULT 120,
     student_count INTEGER DEFAULT 0,
     status TEXT DEFAULT 'unscheduled' CHECK(status IN ('scheduled','unscheduled','no_final_exam')),
@@ -96,12 +97,19 @@ async function initDB() {
         db.run(`UPDATE subjects SET room_placement_type = 'TH' WHERE room_placement_type IS NULL OR TRIM(room_placement_type) = ''`);
     }
 
+    if (!subjectsCols[0].values.some(col => col[1] === 'capacity_type')) {
+        db.run("ALTER TABLE subjects ADD COLUMN capacity_type TEXT NOT NULL DEFAULT 'major' CHECK(capacity_type IN ('major', 'minor'))");
+    }
+
     db.run(`CREATE TABLE IF NOT EXISTS exam_periods (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     exam_date TEXT NOT NULL,
     start_time TEXT NOT NULL,
     end_time TEXT NOT NULL,
     student_cap INTEGER,
+    major_cap INTEGER,
+    minor_cap INTEGER,
+    subject_cap INTEGER,
     UNIQUE(exam_date, start_time, end_time)
   )`);
 
@@ -110,6 +118,16 @@ async function initDB() {
         examPeriodsCols[0].values.some(col => col[1] === 'student_cap');
     if (!hasStudentCap) {
         db.run(`ALTER TABLE exam_periods ADD COLUMN student_cap INTEGER`);
+    }
+    if (!examPeriodsCols[0].values.some(col => col[1] === 'major_cap')) {
+        db.run('ALTER TABLE exam_periods ADD COLUMN major_cap INTEGER');
+        db.run('UPDATE exam_periods SET major_cap = student_cap WHERE student_cap > 0');
+    }
+    if (!examPeriodsCols[0].values.some(col => col[1] === 'minor_cap')) {
+        db.run('ALTER TABLE exam_periods ADD COLUMN minor_cap INTEGER');
+    }
+    if (!examPeriodsCols[0].values.some(col => col[1] === 'subject_cap')) {
+        db.run('ALTER TABLE exam_periods ADD COLUMN subject_cap INTEGER');
     }
 
     db.run(`CREATE TABLE IF NOT EXISTS schedule (

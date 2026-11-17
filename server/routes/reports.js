@@ -1,8 +1,9 @@
 const express = require('express');
 const router = express.Router();
-const xlsx = require('xlsx');
+const { createReportWorkbook, addReportSheet } = require('../utils/reportWorkbook');
 const fs = require('fs');
 const path = require('path');
+const { randomUUID } = require('crypto');
 const { buildAllocatedScheduleEntries } = require('../utils/scheduleAllocation');
 
 function resultToObjects(result) {
@@ -25,8 +26,8 @@ function sanitizeSheetName(name) {
 
 function uniqueSheetName(base, used) {
     let name = sanitizeSheetName(base);
-    if (!used.has(name)) {
-        used.add(name);
+    if (!used.has(name.toLowerCase())) {
+        used.add(name.toLowerCase());
         return name;
     }
     let i = 2;
@@ -34,20 +35,25 @@ function uniqueSheetName(base, used) {
         const suffix = ` (${i})`;
         const trimmed = name.slice(0, Math.max(1, 31 - suffix.length));
         const candidate = `${trimmed}${suffix}`;
-        if (!used.has(candidate)) {
-            used.add(candidate);
+        if (!used.has(candidate.toLowerCase())) {
+            used.add(candidate.toLowerCase());
             return candidate;
         }
         i++;
     }
 }
 
-function writeWorkbookToTempFile(wb, filename) {
-    const buffer = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
+function exportFilename(filename, extension) {
+    const base = String(filename || 'export').replace(/[^a-zA-Z0-9_.-]/g, '').replace(/\.[^.]*$/, '') || 'export';
+    return `${Date.now()}_${randomUUID()}_${base.slice(0, 120)}.${extension}`;
+}
+
+async function writeWorkbookToTempFile(wb, filename) {
+    const buffer = await wb.xlsx.writeBuffer();
     const uploadsDir = path.join(__dirname, '..', 'uploads');
     if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
 
-    const tempFilename = `${Date.now()}_${String(filename || 'export.xlsx').replace(/[^a-zA-Z0-9_.-]/g, '')}`;
+    const tempFilename = exportFilename(filename, 'xlsx');
     const filePath = path.join(uploadsDir, tempFilename);
     fs.writeFileSync(filePath, buffer);
 
@@ -62,7 +68,7 @@ function writeTextToTempFile(content, filename) {
     const uploadsDir = path.join(__dirname, '..', 'uploads');
     if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
 
-    const tempFilename = `${Date.now()}_${String(filename || 'export.doc').replace(/[^a-zA-Z0-9_.-]/g, '')}`;
+    const tempFilename = exportFilename(filename, 'doc');
     const filePath = path.join(uploadsDir, tempFilename);
     fs.writeFileSync(filePath, String(content || ''), 'utf8');
 
@@ -81,7 +87,13 @@ router.get('/schedule', (req, res) => {
             subject_code: row.subject_code,
             subject_name: row.subject_name,
             department: row.department,
+            program: row.program,
+            exam_period_id: row.exam_period_id,
+            room_placement_type: row.room_placement_type,
+            assigned_student_id_range: row.assigned_student_id_range,
             student_count: row.student_count,
+            capacity_pool: row.capacity_pool,
+            capacity_valid: row.capacity_valid,
             exam_date: row.exam_date,
             start_time: row.start_time,
             end_time: row.end_time,
@@ -98,8 +110,9 @@ router.get('/schedule', (req, res) => {
 router.get('/remaining', (req, res) => {
     const db = req.app.locals.db;
     try {
-        const result = db.exec(`SELECT * FROM subjects WHERE status = 'unscheduled' ORDER BY subject_code`);
-        res.json(resultToObjects(result));
+        const result = db.exec(`SELECT sub.* FROM subjects sub WHERE sub.status != 'no_final_exam'
+            AND NOT EXISTS (SELECT 1 FROM schedule s WHERE s.subject_code = sub.subject_code) ORDER BY sub.subject_code`);
+        res.json(resultToObjects(result).map(row => ({ ...row, status: 'unscheduled' })));
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -109,7 +122,8 @@ router.get('/remaining', (req, res) => {
 router.get('/no-final', (req, res) => {
     const db = req.app.locals.db;
     try {
-        const result = db.exec(`SELECT * FROM subjects WHERE status = 'no_final_exam' ORDER BY subject_code`);
+        const result = db.exec(`SELECT sub.* FROM subjects sub WHERE sub.status = 'no_final_exam'
+            AND NOT EXISTS (SELECT 1 FROM schedule s WHERE s.subject_code = sub.subject_code) ORDER BY sub.subject_code`);
         res.json(resultToObjects(result));
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -117,10 +131,10 @@ router.get('/no-final', (req, res) => {
 });
 
 // POST generic export to excel with specific filename
-router.post('/export-excel', (req, res) => {
+router.post('/export-excel', async (req, res) => {
     try {
-        const { filename = 'export.xlsx', sheetName, data_json, sheets_json } = req.body;
-        const wb = xlsx.utils.book_new();
+        const { filename = 'export.xlsx', sheetName, title, data_json, sheets_json } = req.body || {};
+        const wb = createReportWorkbook();
         const usedSheetNames = new Set();
 
         if (sheets_json) {
@@ -129,30 +143,34 @@ router.post('/export-excel', (req, res) => {
                 return res.status(400).json({ error: 'Missing sheets data' });
             }
             for (const sheet of sheets) {
-                const rows = Array.isArray(sheet?.data) ? sheet.data : [];
-                const ws = xlsx.utils.json_to_sheet(rows);
+                if (!sheet || !Array.isArray(sheet.data) || sheet.data.some(row => !row || typeof row !== 'object' || Array.isArray(row))) {
+                    return res.status(400).json({ error: 'Each sheet must contain an array of row objects' });
+                }
+                const rows = sheet.data;
                 const name = uniqueSheetName(sheet?.sheetName || 'Sheet', usedSheetNames);
-                xlsx.utils.book_append_sheet(wb, ws, name);
+                addReportSheet(wb, name, rows, { title: sheet.title, autoFilter: sheet.autoFilter, printHeaderFooter: sheet.printHeaderFooter });
             }
         } else {
             if (!data_json) return res.status(400).json({ error: 'Missing data' });
             const data = JSON.parse(data_json);
-            const ws = xlsx.utils.json_to_sheet(data);
+            if (!Array.isArray(data) || data.some(row => !row || typeof row !== 'object' || Array.isArray(row))) {
+                return res.status(400).json({ error: 'Data must be an array of row objects' });
+            }
             const name = uniqueSheetName(sheetName || 'export', usedSheetNames);
-            xlsx.utils.book_append_sheet(wb, ws, name);
+            addReportSheet(wb, name, data, { title });
         }
 
-        const url = writeWorkbookToTempFile(wb, filename);
+        const url = await writeWorkbookToTempFile(wb, filename);
         res.json({ url });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to generate Excel file: ' + err.message });
+        res.status(err instanceof SyntaxError ? 400 : 500).json({ error: 'Failed to generate Excel file: ' + err.message });
     }
 });
 
 router.post('/export-word', (req, res) => {
     try {
         const { filename = 'export.doc', html = '' } = req.body || {};
-        if (!String(html || '').trim()) {
+        if (typeof html !== 'string' || !html.trim()) {
             return res.status(400).json({ error: 'Missing html' });
         }
         const url = writeTextToTempFile(html, filename);

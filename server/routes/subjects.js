@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+const { normalizeCapacityType, withCapacityTransaction } = require('../utils/capacity');
 
 // Helper: convert sql.js result to array of objects
 function resultToObjects(result) {
@@ -62,7 +63,7 @@ router.get('/', (req, res) => {
         const result = db.exec(query, params);
         res.json(resultToObjects(result));
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -88,7 +89,7 @@ router.get('/same-period-groups', (req, res) => {
         }));
         res.json(groups);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -139,7 +140,7 @@ router.post('/same-period-groups', (req, res) => {
         db.saveToFile();
         res.json({ success: true, id: groupId });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -174,7 +175,7 @@ router.delete('/same-period-groups/:id', (req, res) => {
         db.saveToFile();
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -187,7 +188,7 @@ router.get('/:code', (req, res) => {
         if (subjects.length === 0) return res.status(404).json({ error: 'Subject not found' });
         res.json(subjects[0]);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -195,7 +196,7 @@ router.get('/:code', (req, res) => {
 router.put('/:code', (req, res) => {
     const db = req.app.locals.db;
     try {
-        const { subject_name, department, program, level, room_placement_type, exam_duration, status, notes } = req.body;
+        const { subject_name, department, program, level, room_placement_type, capacity_type, exam_duration, status, notes } = req.body;
         const code = req.params.code;
 
         // Get old values for audit
@@ -228,6 +229,10 @@ router.put('/:code', (req, res) => {
             updates.push(`room_placement_type = ?`);
             params.push(normalizeRoomPlacementType(room_placement_type));
         }
+        if (capacity_type !== undefined) {
+            updates.push('capacity_type = ?');
+            params.push(normalizeCapacityType(capacity_type));
+        }
         if (exam_duration !== undefined) {
             updates.push(`exam_duration = ?`);
             params.push(exam_duration);
@@ -246,19 +251,22 @@ router.put('/:code', (req, res) => {
         }
 
         params.push(code);
-        db.run(`UPDATE subjects SET ${updates.join(', ')} WHERE subject_code = ?`, params);
+        withCapacityTransaction(db, () => {
+            db.run(`UPDATE subjects SET ${updates.join(', ')} WHERE subject_code = ?`, params);
 
-        // If status changed to no_final_exam, remove from schedule
-        if (status === 'no_final_exam') {
-            db.run(`DELETE FROM schedule WHERE subject_code = ?`, [code]);
-            db.run(`DELETE FROM same_period_group_subjects WHERE subject_code = ?`, [code]);
-            cleanupSmallGroups(db);
-        }
+            // If status changed to no_final_exam, remove from schedule
+            if (status === 'no_final_exam') {
+                db.run(`DELETE FROM schedule WHERE subject_code = ?`, [code]);
+                db.run(`DELETE FROM same_period_group_subjects WHERE subject_code = ?`, [code]);
+                cleanupSmallGroups(db);
+            }
 
-        // If status changed to unscheduled, remove from schedule
-        if (status === 'unscheduled') {
-            db.run(`DELETE FROM schedule WHERE subject_code = ?`, [code]);
-        }
+            // If status changed to unscheduled, remove from schedule
+            if (status === 'unscheduled') {
+                db.run(`DELETE FROM schedule WHERE subject_code = ?`, [code]);
+            }
+
+        });
 
         // Audit log
         if (oldSubject && status && oldSubject.status !== status) {
@@ -269,8 +277,8 @@ router.put('/:code', (req, res) => {
         db.saveToFile();
         res.json({ success: true });
     } catch (err) {
-        console.error('PUT /api/subjects/:code failed', err);
-        res.status(500).json({ error: err?.message || String(err) || 'Failed to update subject' });
+        if (!err.status) console.error('PUT /api/subjects/:code failed', err);
+        res.status(err.status || 500).json({ error: err?.message || String(err) || 'Failed to update subject' });
     }
 });
 
@@ -318,6 +326,9 @@ router.post('/import', (req, res) => {
                     row.room_placement_type || row.Room_Placement_Type || row.room_type || row.Room_Type || row.placement_type || row.Placement_Type || 'TH'
                 );
 
+                const capacityRaw = row.capacity_type ?? row.Capacity_Type;
+                const capacityType = capacityRaw === undefined || capacityRaw === '' ? null : normalizeCapacityType(capacityRaw);
+
                 const duration = parseInt(
                     row.exam_duration || row.Exam_Duration || row.ExamDuration ||
                     row.duration || row.Duration || 120
@@ -338,40 +349,44 @@ router.post('/import', (req, res) => {
                 const status = isNoExam ? 'no_final_exam' : 'unscheduled';
                 const existing = db.exec(`SELECT subject_code FROM subjects WHERE subject_code = ?`, [code]);
 
-                if (existing.length && existing[0].values.length) {
-                    // Update existing — apply status only if no_exam column was explicitly provided
-                    const hasNoExamCol = noExamRaw !== '';
-                    if (hasNoExamCol && isNoExam) {
-                        // Flagged as no_final_exam: remove from schedule too
-                        db.run(`DELETE FROM schedule WHERE subject_code = ?`, [code]);
-                    }
-                    db.run(`UPDATE subjects SET
-                        subject_name  = COALESCE(NULLIF(?, ''), subject_name),
-                        department    = COALESCE(NULLIF(?, ''), department),
-                        program       = COALESCE(NULLIF(?, ''), program),
-                        level         = COALESCE(NULLIF(?, ''), level),
-                        room_placement_type = ?,
-                        exam_duration = ?,
-                        notes         = COALESCE(NULLIF(?, ''), notes)
-                        ${hasNoExamCol ? ', status = ?' : ''}
-                        WHERE subject_code = ?`,
-                        hasNoExamCol
-                            ? [name, department, program, level, roomPlacementType, duration, notes, status, code]
-                            : [name, department, program, level, roomPlacementType, duration, notes, code]);
-                    updated++;
-                } else {
-                    // Compute student_count from registrations if available
-                    const regCount = db.exec(
-                        `SELECT COUNT(DISTINCT student_id) as c FROM registrations WHERE subject_code = ?`, [code]
-                    );
-                    const studentCount = regCount.length ? regCount[0].values[0][0] : 0;
+                const wasUpdated = withCapacityTransaction(db, () => {
+                    if (existing.length && existing[0].values.length) {
+                        // Update existing — apply status only if no_exam column was explicitly provided
+                        const hasNoExamCol = noExamRaw !== '';
+                        if (hasNoExamCol && isNoExam) {
+                            // Flagged as no_final_exam: remove from schedule too
+                            db.run(`DELETE FROM schedule WHERE subject_code = ?`, [code]);
+                        }
+                        db.run(`UPDATE subjects SET
+                            subject_name  = COALESCE(NULLIF(?, ''), subject_name),
+                            department    = COALESCE(NULLIF(?, ''), department),
+                            program       = COALESCE(NULLIF(?, ''), program),
+                            level         = COALESCE(NULLIF(?, ''), level),
+                            room_placement_type = ?,
+                            capacity_type = COALESCE(?, capacity_type),
+                            exam_duration = ?,
+                            notes         = COALESCE(NULLIF(?, ''), notes)
+                            ${hasNoExamCol ? ', status = ?' : ''}
+                            WHERE subject_code = ?`,
+                            hasNoExamCol
+                                ? [name, department, program, level, roomPlacementType, capacityType, duration, notes, status, code]
+                                : [name, department, program, level, roomPlacementType, capacityType, duration, notes, code]);
+                        return true;
+                    } else {
+                        // Compute student_count from registrations if available
+                        const regCount = db.exec(
+                            `SELECT COUNT(DISTINCT student_id) as c FROM registrations WHERE subject_code = ?`, [code]
+                        );
+                        const studentCount = regCount.length ? regCount[0].values[0][0] : 0;
 
-                    db.run(`INSERT INTO subjects
-                        (subject_code, subject_name, department, program, level, room_placement_type, exam_duration, notes, student_count, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                        [code, name, department, program, level, roomPlacementType, duration, notes, studentCount, status]);
-                    imported++;
-                }
+                        db.run(`INSERT INTO subjects
+                            (subject_code, subject_name, department, program, level, room_placement_type, capacity_type, exam_duration, notes, student_count, status)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            [code, name, department, program, level, roomPlacementType, capacityType || 'major', duration, notes, studentCount, status]);
+                        return false;
+                    }
+                });
+                if (wasUpdated) updated++; else imported++;
             } catch (rowErr) {
                 errors.push(rowErr.message);
             }
@@ -380,7 +395,7 @@ router.post('/import', (req, res) => {
         db.saveToFile();
         res.json({ success: true, imported, updated, errors: errors.slice(0, 20) });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -388,17 +403,17 @@ router.post('/import', (req, res) => {
 router.post('/', (req, res) => {
     const db = req.app.locals.db;
     try {
-        const { subject_code, subject_name, department, program, level, room_placement_type, exam_duration, notes } = req.body;
+        const { subject_code, subject_name, department, program, level, room_placement_type, capacity_type, exam_duration, notes } = req.body;
         if (!subject_code) return res.status(400).json({ error: 'Subject code required' });
 
-        db.run(`INSERT OR IGNORE INTO subjects (subject_code, subject_name, department, program, level, room_placement_type, exam_duration, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-            [subject_code, subject_name || '', department || '', program || '', level || '', normalizeRoomPlacementType(room_placement_type), exam_duration || 120, notes || '']);
+        db.run(`INSERT OR IGNORE INTO subjects (subject_code, subject_name, department, program, level, room_placement_type, capacity_type, exam_duration, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [subject_code, subject_name || '', department || '', program || '', level || '', normalizeRoomPlacementType(room_placement_type), normalizeCapacityType(capacity_type), exam_duration || 120, notes || '']);
 
         db.saveToFile();
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -408,25 +423,28 @@ router.post('/bulk-update', (req, res) => {
     try {
         const { data } = req.body;
         let updated = 0;
-        for (const item of data) {
-            if (item.subject_code) {
-                db.run(`UPDATE subjects SET
-          subject_name = COALESCE(?, subject_name),
-          department = COALESCE(?, department),
-          program = COALESCE(?, program),
-          level = COALESCE(?, level),
-          room_placement_type = COALESCE(?, room_placement_type),
-          exam_duration = COALESCE(?, exam_duration),
-          notes = COALESCE(?, notes)
-          WHERE subject_code = ?`,
-                    [item.subject_name, item.department, item.program, item.level, item.room_placement_type ? normalizeRoomPlacementType(item.room_placement_type) : null, item.exam_duration, item.notes, item.subject_code]);
-                updated++;
+        withCapacityTransaction(db, () => {
+            for (const item of data) {
+                if (item.subject_code) {
+                    db.run(`UPDATE subjects SET
+              subject_name = COALESCE(?, subject_name),
+              department = COALESCE(?, department),
+              program = COALESCE(?, program),
+              level = COALESCE(?, level),
+              room_placement_type = COALESCE(?, room_placement_type),
+              capacity_type = COALESCE(?, capacity_type),
+              exam_duration = COALESCE(?, exam_duration),
+              notes = COALESCE(?, notes)
+              WHERE subject_code = ?`,
+                        [item.subject_name, item.department, item.program, item.level, item.room_placement_type ? normalizeRoomPlacementType(item.room_placement_type) : null, item.capacity_type === undefined ? null : normalizeCapacityType(item.capacity_type), item.exam_duration, item.notes, item.subject_code].map(value => value ?? null));
+                    updated++;
+                }
             }
-        }
+        });
         db.saveToFile();
         res.json({ success: true, updated });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 
@@ -443,7 +461,7 @@ router.delete('/all', (req, res) => {
         db.saveToFile();
         res.json({ success: true, cleared: count });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(err.status || 500).json({ error: err.message });
     }
 });
 

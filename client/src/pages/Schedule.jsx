@@ -1,10 +1,12 @@
+import DateInput from '../components/DateInput'
 import { useState, useEffect, useRef } from 'react'
 import { api } from '../api'
+import CapacityInputs, { CapacitySummary } from '../components/CapacityInputs'
 import { icons, useToast } from '../App'
 import * as XLSX from 'xlsx'
 
 import { downloadExcelFromBackend } from '../utils/export';
-import { formatExamDateDisplay, sortRowsByDate } from '../utils/date'
+import { formatExamDateDisplay, formatDatesInText, sortRowsByDate } from '../utils/date'
 
 export default function Schedule() {
     const [periods, setPeriods] = useState([])
@@ -22,11 +24,10 @@ export default function Schedule() {
     const [confirmClear, setConfirmClear] = useState(false)
     const [showManage, setShowManage] = useState(false)
     const [editingPeriod, setEditingPeriod] = useState(null) // { id, exam_date, start_time, end_time }
-    const [newPeriodRow, setNewPeriodRow] = useState({ exam_date: '', start_time: '09:00', end_time: '11:00', student_cap: '' })
+    const [newPeriodRow, setNewPeriodRow] = useState({ exam_date: '', start_time: '09:00', end_time: '11:00', major_cap: '', minor_cap: '', subject_cap: '' })
     const [assignSearch, setAssignSearch] = useState('')
     const [addPeriodPrograms, setAddPeriodPrograms] = useState(['ALL'])
-    const [setupPeriodCap, setSetupPeriodCap] = useState('')
-    const [allPeriodsCap, setAllPeriodsCap] = useState('')
+    const [setupPeriodCaps, setSetupPeriodCaps] = useState({ major_cap: '', minor_cap: '', subject_cap: '' })
     const fileRef = useRef()
     const addToast = useToast()
 
@@ -191,7 +192,7 @@ export default function Schedule() {
                 exam_date: period.exam_date,
                 start_time: period.start_time,
                 end_time: period.end_time,
-                student_cap: period.student_cap
+                major_cap: period.major_cap, minor_cap: period.minor_cap, subject_cap: period.subject_cap
             })
             addToast(`Period updated`, 'success')
             setEditingPeriod(null)
@@ -212,9 +213,9 @@ export default function Schedule() {
         const { exam_date, start_time, end_time } = newPeriodRow
         if (!exam_date) { addToast('Date is required', 'warning'); return }
         try {
-            await api.createPeriod({ exam_date, start_time, end_time, student_cap: newPeriodRow.student_cap })
+            await api.createPeriod({ exam_date, start_time, end_time, major_cap: newPeriodRow.major_cap, minor_cap: newPeriodRow.minor_cap, subject_cap: newPeriodRow.subject_cap })
             addToast('Period added', 'success')
-            setNewPeriodRow({ exam_date: '', start_time: '09:00', end_time: '11:00', student_cap: '' })
+            setNewPeriodRow({ exam_date: '', start_time: '09:00', end_time: '11:00', major_cap: '', minor_cap: '', subject_cap: '' })
             loadAll()
         } catch (err) { addToast(err.message, 'error') }
     }
@@ -223,6 +224,8 @@ export default function Schedule() {
         try {
             const result = await api.autoSchedule()
             setAutoResult(result)
+            if (!result.success) { addToast(result.error || 'Auto-scheduling failed', 'error'); return }
+            if (result.warning) addToast(result.warning, 'warning')
             addToast(`Auto-scheduled ${result.placed} subjects`, 'success')
             loadAll()
         } catch (err) { addToast(err.message, 'error') }
@@ -233,21 +236,13 @@ export default function Schedule() {
             const dateList = setupDates.split('\n').map(d => d.trim()).filter(Boolean)
             if (dateList.length === 0) { addToast('Enter at least one date', 'warning'); return }
             if (setupPeriods.length === 0) { addToast('Add at least one time period', 'warning'); return }
-            await api.bulkCreatePeriods(dateList, setupPeriods, setupPeriodCap)
+            await api.bulkCreatePeriods(dateList, setupPeriods, setupPeriodCaps)
             addToast(`Created ${dateList.length * setupPeriods.length} exam slots`, 'success')
             setShowSetup(false)
             loadAll()
         } catch (err) { addToast(err.message, 'error') }
     }
 
-    async function handleApplyCapToAllPeriods(clearCap = false) {
-        try {
-            await api.setAllPeriodsCap(clearCap ? '' : allPeriodsCap)
-            addToast(clearCap ? 'Cleared cap for all periods' : 'Applied cap to all periods', 'success')
-            if (clearCap) setAllPeriodsCap('')
-            loadAll()
-        } catch (err) { addToast(err.message, 'error') }
-    }
 
     async function handleImportSchedule(e) {
         const file = e.target.files?.[0]
@@ -277,31 +272,17 @@ export default function Schedule() {
 
     function downloadScheduleTemplate() {
         const template = [
-            { subject_code: 'CSE565', exam_date: '2026/10/05', start_time: '09:00', end_time: '11:00' },
-            { subject_code: 'CSE575', exam_date: '2026/10/05', start_time: '12:00', end_time: '14:00' },
-            { subject_code: 'MTH301', exam_date: '2026/11/05', start_time: '09:00', end_time: '11:00' }
+            { subject_code: 'CSE565', exam_date: '10/05/2026', start_time: '09:00', end_time: '11:00' },
+            { subject_code: 'CSE575', exam_date: '10/05/2026', start_time: '12:00', end_time: '14:00' },
+            { subject_code: 'MTH301', exam_date: '11/05/2026', start_time: '09:00', end_time: '11:00' }
         ]
         downloadExcelFromBackend('schedule_import_template.xlsx', 'Schedule Template', template);
         addToast('Template downloaded', 'success')
     }
 
     function formatDate(dateStr) {
-        try {
-            let isoStr = dateStr;
-            if (dateStr.includes('-')) {
-                const [y, m, d] = dateStr.split('-');
-                isoStr = `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
-            }
-            const dateObj = new Date(isoStr + 'T00:00:00');
-            if (!isNaN(dateObj)) {
-                return dateObj.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
-            }
-            const fallback = new Date(dateStr);
-            if (!isNaN(fallback)) {
-                return fallback.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })
-            }
-        } catch { }
-        return dateStr
+        const date = new Date(`${dateStr}T12:00:00Z`)
+        return Number.isNaN(date.getTime()) ? '' : date.toLocaleDateString('en-GB', { weekday: 'long', timeZone: 'UTC' })
     }
 
     const unscheduledSubjects = subjects.filter(s => s.status === 'unscheduled')
@@ -378,7 +359,7 @@ export default function Schedule() {
                     </div>
                     {autoResult.failed?.length > 0 && (
                         <div style={{ marginTop: 8, fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
-                            Failed: {autoResult.failed.map(f => f.subject_code).join(', ')}
+                            {autoResult.failed.map(f => <div key={f.subject_code}>{f.subject_code}: {formatDatesInText(f.reason)}</div>)}
                         </div>
                     )}
                 </div>
@@ -528,23 +509,16 @@ export default function Schedule() {
                         </div>
                         <div className="modal-body">
                             <div className="form-group">
-                                <label className="form-label">Exam Dates (one per line, YYYY/DD/MM or YYYY-MM-DD)</label>
+                                <label className="form-label">Exam Dates (one per line, DD/MM/YYYY or YYYY-MM-DD)</label>
                                 <textarea className="form-textarea" rows={6} value={setupDates}
                                     onChange={e => setSetupDates(e.target.value)}
-                                    placeholder={"2026-05-10\n2026-05-11\n2026-05-12\n2026-05-13\n2026-05-14"} />
+                                    placeholder={"10/05/2026\n11/05/2026\n12/05/2026\n13/05/2026\n14/05/2026"} />
                             </div>
                             <div className="form-group mt-lg">
                                 <label className="form-label">Time Periods</label>
                                 <div className="schedule-setup-cap-row">
-                                    <input
-                                        className="form-input"
-                                        type="number"
-                                        min="1"
-                                        placeholder="Open cap"
-                                        value={setupPeriodCap}
-                                        onChange={e => setSetupPeriodCap(e.target.value)}
-                                    />
-                                    <span className="text-muted text-sm">Optional cap applied to all created periods. Leave blank for open cap.</span>
+                                    <CapacityInputs value={setupPeriodCaps} onChange={setSetupPeriodCaps} />
+                                    <span className="text-muted text-sm">Optional limits for the new slots. Blank means unlimited; zero prevents student assignments.</span>
                                 </div>
                                 {setupPeriods.map((p, i) => (
                                     <div key={i} className="schedule-setup-period-row">
@@ -576,16 +550,17 @@ export default function Schedule() {
                 <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) { setShowAssign(null); setAssignSearch('') } }}>
                     <div className="modal">
                         <div className="modal-header">
-                            <h3 className="modal-title">Assign Subject — {showAssign.date} {showAssign.time}</h3>
+                            <h3 className="modal-title">Assign Subject — {formatExamDateDisplay(showAssign.date)} {showAssign.time}</h3>
                             <button className="btn-icon" onClick={() => { setShowAssign(null); setAssignSearch('') }}>{icons.close}</button>
                         </div>
                         <div className="modal-body">
                             {/* Period selector */}
+                            <p className="text-sm text-muted mb-md">Manual assignments can exceed the period's total capacity. The maximum students per subject still applies. Automatic scheduling follows all capacity limits.</p>
                             <div className="form-group mb-lg">
                                 <label className="form-label">Target Period</label>
                                 <select className="form-select" value={showAssign.periodId} onChange={e => setShowAssign({ ...showAssign, periodId: parseInt(e.target.value) })}>
                                     {periods.map(p => (
-                                        <option key={p.id} value={p.id}>{p.exam_date} {p.start_time}–{p.end_time}</option>
+                                        <option key={p.id} value={p.id}>{formatExamDateDisplay(p.exam_date)} {p.start_time}–{p.end_time}</option>
                                     ))}
                                 </select>
                             </div>
@@ -668,7 +643,7 @@ export default function Schedule() {
                         <div className="modal-body">
                             <div className="flex items-center justify-between mb-md">
                                 <p className="text-sm text-muted" style={{ margin: 0 }}>
-                                    Columns: <code>subject_code</code>, <code>exam_date</code> (YYYY/DD/MM or YYYY-MM-DD), <code>start_time</code> (HH:MM), <code>end_time</code> (HH:MM)
+                                    Columns: <code>subject_code</code>, <code>exam_date</code> (DD/MM/YYYY or YYYY-MM-DD), <code>start_time</code> (HH:MM), <code>end_time</code> (HH:MM)
                                 </p>
                                 <button className="btn btn-secondary btn-sm" onClick={downloadScheduleTemplate} style={{ whiteSpace: 'nowrap', flexShrink: 0 }}>
                                     {icons.download} <span>Download Template</span>
@@ -698,7 +673,7 @@ export default function Schedule() {
                                         <th>Date</th>
                                         <th>Start Time</th>
                                         <th>End Time</th>
-                                        <th style={{ width: 120 }}>Cap</th>
+                                        <th style={{ minWidth: 250 }}>Capacity Limits</th>
                                         <th style={{ width: 80 }}>Subjects</th>
                                         <th style={{ width: 100 }}>Actions</th>
                                     </tr>
@@ -713,9 +688,9 @@ export default function Schedule() {
                                             <tr key={p.id}>
                                                 <td>
                                                     {isEditing
-                                                        ? <input type="date" className="form-input" value={row.exam_date}
+                                                        ? <DateInput  className="form-input" value={row.exam_date}
                                                             onChange={e => setEditingPeriod({ ...row, exam_date: e.target.value })} />
-                                                        : <strong>{p.exam_date}</strong>
+                                                        : <strong>{formatExamDateDisplay(p.exam_date)}</strong>
                                                     }
                                                 </td>
                                                 <td>
@@ -732,19 +707,7 @@ export default function Schedule() {
                                                         : p.end_time
                                                     }
                                                 </td>
-                                                <td>
-                                                    {isEditing
-                                                        ? <input
-                                                            type="number"
-                                                            min="1"
-                                                            className="form-input"
-                                                            value={row.student_cap ?? ''}
-                                                            placeholder="Open"
-                                                            onChange={e => setEditingPeriod({ ...row, student_cap: e.target.value })}
-                                                        />
-                                                        : (p.student_cap || <span className="text-muted">Open</span>)
-                                                    }
-                                                </td>
+                                                <td>{isEditing ? <CapacityInputs value={row} onChange={setEditingPeriod} /> : <CapacitySummary value={p} />}</td>
                                                 <td style={{ textAlign: 'center' }}>
                                                     {subjectCount > 0 && <span className="badge badge-scheduled">{subjectCount}</span>}
                                                 </td>
@@ -770,7 +733,7 @@ export default function Schedule() {
                                     {/* Add new period row */}
                                     <tr style={{ background: 'var(--bg-surface)' }}>
                                         <td>
-                                            <input type="date" className="form-input" value={newPeriodRow.exam_date}
+                                            <DateInput  className="form-input" value={newPeriodRow.exam_date}
                                                 onChange={e => setNewPeriodRow(r => ({ ...r, exam_date: e.target.value }))} />
                                         </td>
                                         <td>
@@ -781,16 +744,7 @@ export default function Schedule() {
                                             <input type="time" className="form-input" value={newPeriodRow.end_time}
                                                 onChange={e => setNewPeriodRow(r => ({ ...r, end_time: e.target.value }))} />
                                         </td>
-                                        <td>
-                                            <input
-                                                type="number"
-                                                min="1"
-                                                className="form-input"
-                                                value={newPeriodRow.student_cap}
-                                                placeholder="Open"
-                                                onChange={e => setNewPeriodRow(r => ({ ...r, student_cap: e.target.value }))}
-                                            />
-                                        </td>
+                                        <td><CapacityInputs value={newPeriodRow} onChange={setNewPeriodRow} /></td>
                                         <td />
                                         <td>
                                             <button className="btn btn-primary btn-sm" onClick={handleAddPeriodRow}>{icons.plus} Add</button>
@@ -800,18 +754,7 @@ export default function Schedule() {
                             </table>
                         </div>
                         <div className="modal-footer schedule-manage-footer">
-                            <div className="schedule-cap-controls">
-                                <input
-                                    type="number"
-                                    min="1"
-                                    className="form-input"
-                                    placeholder="Set cap for all periods"
-                                    value={allPeriodsCap}
-                                    onChange={e => setAllPeriodsCap(e.target.value)}
-                                />
-                                <button className="btn btn-secondary btn-sm" onClick={() => handleApplyCapToAllPeriods(false)}>Apply Cap To All</button>
-                                <button className="btn btn-ghost btn-sm" onClick={() => handleApplyCapToAllPeriods(true)}>Clear To Open</button>
-                            </div>
+                            <a className="btn btn-secondary btn-sm" href="/slots">Set limits for selected slots</a>
                             <div className="schedule-manage-actions">
                                 <button className="btn btn-danger btn-sm" onClick={async () => {
                                     if (!confirm('Delete ALL periods? This will also unschedule all subjects.')) return

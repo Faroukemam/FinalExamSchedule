@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const XLSX = require('xlsx');
+const { withCapacityTransaction } = require('../utils/capacity');
 
 // Helper: normalize courses string into unique subject codes
 function normalizeCourses(coursesStr) {
@@ -91,20 +92,23 @@ router.post('/import', (req, res) => {
                     continue;
                 }
 
-                // Upsert student
-                db.run(`INSERT OR REPLACE INTO students (student_id, student_name, department, program, level, section)
-                VALUES (?, ?, ?, ?, ?, ?)`, [studentId, studentName, department, program, level, section]);
-                studentsImported++;
+                const registered = withCapacityTransaction(db, () => {
+                    // Upsert student
+                    db.run(`INSERT OR REPLACE INTO students (student_id, student_name, department, program, level, section)
+                    VALUES (?, ?, ?, ?, ?, ?)`, [studentId, studentName, department, program, level, section]);
 
-                // Normalize and insert registrations
-                const subjectCodes = normalizeCourses(coursesRaw);
-                for (const code of subjectCodes) {
-                    // Ensure subject exists
-                    db.run(`INSERT OR IGNORE INTO subjects (subject_code) VALUES (?)`, [code]);
-                    // Insert registration
-                    db.run(`INSERT OR IGNORE INTO registrations (student_id, subject_code) VALUES (?, ?)`, [studentId, code]);
-                    registrationsImported++;
-                }
+                    // Normalize and insert registrations
+                    const subjectCodes = normalizeCourses(coursesRaw);
+                    for (const code of subjectCodes) {
+                        // Ensure subject exists
+                        db.run(`INSERT OR IGNORE INTO subjects (subject_code) VALUES (?)`, [code]);
+                        // Insert registration
+                        db.run(`INSERT OR IGNORE INTO registrations (student_id, subject_code) VALUES (?, ?)`, [studentId, code]);
+                    }
+                    return subjectCodes.length;
+                });
+                studentsImported++;
+                registrationsImported += registered;
             } catch (rowErr) {
                 errors.push(rowErr.message);
             }

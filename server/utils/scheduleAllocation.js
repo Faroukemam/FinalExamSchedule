@@ -1,3 +1,5 @@
+const { allocatePools } = require('./poolAllocation');
+
 function resultToObjects(result) {
     if (!result || result.length === 0) return [];
     const columns = result[0].columns;
@@ -161,6 +163,17 @@ function buildAllocatedScheduleEntries(db) {
         }
     }
 
+    const periods = resultToObjects(db.exec('SELECT id, major_cap, minor_cap FROM exam_periods'));
+    for (const period of periods) {
+        const rows = baseRows.filter(row => Number(row.exam_period_id) === Number(period.id));
+        const counts = {};
+        for (const row of rows) counts[row.subject_code] = (counts[row.subject_code] || 0) + row.student_count;
+        const allocation = allocatePools(period, counts);
+        for (const row of rows) {
+            row.capacity_pool = allocation.pools[row.subject_code];
+            row.capacity_valid = allocation.ok;
+        }
+    }
     return baseRows;
 }
 

@@ -1,10 +1,11 @@
+import DateInput from '../components/DateInput'
 import { useState, useEffect } from 'react'
 import { api } from '../api'
 import { icons, useToast } from '../App'
 import * as XLSX from 'xlsx'
 
 import { downloadExcelFromBackend } from '../utils/export';
-import { formatExamDateDisplay, sortRowsByDate } from '../utils/date'
+import { formatExamDateDisplay, normalizeExamDateForInput, sortRowsByDate } from '../utils/date'
 
 export default function Conflicts() {
     const [data, setData] = useState({ conflicts: [], summary: {} })
@@ -20,7 +21,7 @@ export default function Conflicts() {
         setLoading(true)
         try {
             const params = {}
-            Object.entries(filters).forEach(([k, v]) => { if (v) params[k] = v })
+            Object.entries(filters).forEach(([k, v]) => { if (v && (k !== 'exam_date' || normalizeExamDateForInput(v))) params[k] = v })
             const result = await api.getConflicts(params)
             setData(result)
             setPage(1)
@@ -117,7 +118,7 @@ export default function Conflicts() {
                     <option value="consecutive_day">Consecutive Day</option>
                     <option value="back_to_back_warning">Back-to-Back Warning</option>
                 </select>
-                <input className="form-input" style={{ width: 160 }} type="date" value={filters.exam_date}
+                <DateInput className="form-input" style={{ width: 160 }}  value={filters.exam_date}
                     onChange={e => setFilters(f => ({ ...f, exam_date: e.target.value }))} />
                 <button className="btn btn-ghost btn-sm" onClick={() => setFilters({ student_id: '', subject_code: '', department: '', conflict_type: '', exam_date: '' })}>
                     Clear

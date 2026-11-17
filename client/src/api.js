@@ -1,11 +1,11 @@
 const API_BASE = '/api';
 
-async function apiFetch(url, options = {}) {
+async function apiFetch(url, options = {}, acceptedStatuses = []) {
     const res = await fetch(`${API_BASE}${url}`, {
         headers: { 'Content-Type': 'application/json', ...options.headers },
         ...options
     });
-    if (!res.ok) {
+    if (!res.ok && !acceptedStatuses.includes(res.status)) {
         const err = await res.json().catch(() => ({ error: res.statusText }));
         throw new Error(err.error || 'API Error');
     }
@@ -43,9 +43,10 @@ export const api = {
     getPeriods: () => apiFetch('/periods'),
     createPeriod: (data) => apiFetch('/periods', { method: 'POST', body: JSON.stringify(data) }),
     updatePeriod: (id, data) => apiFetch(`/periods/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
-    bulkCreatePeriods: (dates, periods, student_cap = '') => apiFetch('/periods/bulk', { method: 'POST', body: JSON.stringify({ dates, periods, student_cap }) }),
-    importPeriods: (data) => apiFetch('/periods/import', { method: 'POST', body: JSON.stringify({ data }) }),
-    setAllPeriodsCap: (student_cap) => apiFetch('/periods/set-cap-all', { method: 'PUT', body: JSON.stringify({ student_cap }) }),
+    bulkCreatePeriods: (dates, periods, caps = {}) => apiFetch('/periods/bulk', { method: 'POST', body: JSON.stringify({ dates, periods, ...caps }) }),
+    importPeriods: (data, date1904 = false) => apiFetch('/periods/import', { method: 'POST', body: JSON.stringify({ data, date1904 }) }, [422]),
+    setAllPeriodsCap: (caps) => apiFetch('/periods/set-cap-all', { method: 'PUT', body: JSON.stringify(caps) }),
+    setPeriodsCaps: (period_ids, caps) => apiFetch('/periods/set-caps', { method: 'PUT', body: JSON.stringify({ period_ids, ...caps }) }),
     deletePeriod: (id) => apiFetch(`/periods/${id}`, { method: 'DELETE' }),
     deleteAllPeriods: () => apiFetch('/periods', { method: 'DELETE' }),
 

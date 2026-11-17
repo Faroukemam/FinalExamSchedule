@@ -1,15 +1,11 @@
+import DateInput from '../components/DateInput'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import * as XLSX from 'xlsx'
+import { readSlotWorkbook, slotImportFeedback } from '../utils/slotImport'
 import { api } from '../api'
+import CapacityInputs, { CapacitySummary } from '../components/CapacityInputs'
 import { icons, useToast } from '../App'
 import { downloadExcelFromBackend } from '../utils/export'
 import { formatExamDateDisplay, sortRowsByDate } from '../utils/date'
-
-function normalizeCapValue(value) {
-    if (value === '' || value === null || value === undefined) return ''
-    const parsed = Number(value)
-    return Number.isFinite(parsed) && parsed > 0 ? String(Math.round(parsed)) : ''
-}
 
 function durationText(start, end) {
     try {
@@ -31,10 +27,13 @@ export default function Slots() {
     const [periods, setPeriods] = useState([])
     const [schedule, setSchedule] = useState([])
     const [selectedIds, setSelectedIds] = useState([])
-    const [allCap, setAllCap] = useState('')
-    const [newRow, setNewRow] = useState({ exam_date: '', start_time: '09:00', end_time: '11:00', student_cap: '' })
+    const [fieldsToApply, setFieldsToApply] = useState({ major: false, minor: false, subject: true })
+    const [selectedCaps, setSelectedCaps] = useState({ major_cap: '', minor_cap: '', subject_cap: '' })
+    const [newRow, setNewRow] = useState({ exam_date: '', start_time: '09:00', end_time: '11:00', major_cap: '', minor_cap: '', subject_cap: '' })
     const [editingId, setEditingId] = useState(null)
     const [editingRow, setEditingRow] = useState(null)
+    const [importing, setImporting] = useState(false)
+    const [importResult, setImportResult] = useState(null)
 
     useEffect(() => { loadData() }, [])
 
@@ -57,7 +56,9 @@ export default function Slots() {
                 exam_date: row.exam_date,
                 start_time: row.start_time,
                 end_time: row.end_time,
-                student_cap: normalizeCapValue(row.student_cap)
+                major_cap: row.major_cap ?? '',
+                minor_cap: row.minor_cap ?? '',
+                subject_cap: row.subject_cap ?? ''
             })
             addToast('Slot updated', 'success')
             setEditingId(null)
@@ -74,10 +75,12 @@ export default function Slots() {
                 exam_date: newRow.exam_date,
                 start_time: newRow.start_time,
                 end_time: newRow.end_time,
-                student_cap: normalizeCapValue(newRow.student_cap)
+                major_cap: newRow.major_cap ?? '',
+                minor_cap: newRow.minor_cap ?? '',
+                subject_cap: newRow.subject_cap ?? ''
             })
             addToast('Slot added', 'success')
-            setNewRow({ exam_date: '', start_time: '09:00', end_time: '11:00', student_cap: '' })
+            setNewRow({ exam_date: '', start_time: '09:00', end_time: '11:00', major_cap: '', minor_cap: '', subject_cap: '' })
             loadData()
         } catch (err) {
             addToast(err.message, 'error')
@@ -108,11 +111,12 @@ export default function Slots() {
         }
     }
 
-    async function handleApplyCapToAll(clearCap = false) {
+    async function handleApplySelectedCaps(clearCap = false) {
         try {
-            await api.setAllPeriodsCap(clearCap ? '' : allCap)
-            addToast(clearCap ? 'All slots set to open cap' : 'Applied cap to all slots', 'success')
-            if (clearCap) setAllCap('')
+            const caps = Object.fromEntries(['major', 'minor', 'subject'].filter(type => fieldsToApply[type]).map(type => [`${type}_cap`, clearCap ? '' : selectedCaps[`${type}_cap`]]))
+            await api.setPeriodsCaps(selectedIds, caps)
+            addToast(`Updated limits for ${selectedIds.length} selected slots`, 'success')
+            if (clearCap) setSelectedCaps({ major_cap: '', minor_cap: '', subject_cap: '' })
             loadData()
         } catch (err) {
             addToast(err.message, 'error')
@@ -122,17 +126,23 @@ export default function Slots() {
     async function handleImport(e) {
         const file = e.target.files?.[0]
         if (!file) return
+        setImporting(true)
+        setImportResult(null)
         try {
             const buffer = await file.arrayBuffer()
-            const wb = XLSX.read(buffer, { type: 'array' })
-            const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]])
-            const result = await api.importPeriods(data)
-            addToast(`Imported ${result.imported} slots, updated ${result.updated}`, 'success')
-            loadData()
+            const { data, date1904 } = readSlotWorkbook(buffer)
+            const result = await api.importPeriods(data, date1904)
+            setImportResult(result)
+            const feedback = slotImportFeedback(result)
+            addToast(feedback.message, feedback.type)
+            if (result.success) await loadData()
         } catch (err) {
+            setImportResult({ success: false, imported: 0, updated: 0, failed: 0, errors: [err.message] })
             addToast(err.message, 'error')
+        } finally {
+            setImporting(false)
+            if (fileRef.current) fileRef.current.value = ''
         }
-        if (fileRef.current) fileRef.current.value = ''
     }
 
     function exportSlots() {
@@ -144,8 +154,11 @@ export default function Slots() {
                 Start_Time: period.start_time,
                 End_Time: period.end_time,
                 Duration: durationText(period.start_time, period.end_time),
-                Student_Cap: period.student_cap || '',
-                Cap_Status: period.student_cap ? 'Capped' : 'Open',
+                Major_Cap: period.major_cap ?? '',
+                Minor_Cap: period.minor_cap ?? '',
+                Subject_Cap: period.subject_cap ?? '',
+                Major_Students: usageByPeriod[period.id]?.major || 0,
+                Minor_Students: usageByPeriod[period.id]?.minor || 0,
                 Assigned_Subjects: schedule.filter(row => row.exam_period_id === period.id).length
             })))
         downloadExcelFromBackend('slots_and_caps.xlsx', 'Slots', rows)
@@ -154,16 +167,25 @@ export default function Slots() {
 
     function downloadTemplate() {
         downloadExcelFromBackend('slots_import_template.xlsx', 'Slots Template', [
-            { exam_date: '2026/10/05', start_time: '09:00', end_time: '11:00', student_cap: 250 },
-            { exam_date: '2026/10/05', start_time: '12:00', end_time: '14:00', student_cap: '' },
-            { exam_date: '2026/11/05', start_time: '09:00', end_time: '12:00', student_cap: 300 }
+            { exam_date: '10/05/2026', start_time: '09:00', end_time: '11:00', major_cap: 250, minor_cap: 100, subject_cap: 100 },
+            { exam_date: '10/05/2026', start_time: '12:00', end_time: '14:00', major_cap: '', minor_cap: '', subject_cap: '' },
+            { exam_date: '11/05/2026', start_time: '09:00', end_time: '12:00', major_cap: 300, minor_cap: 150, subject_cap: 120 }
         ])
         addToast('Template downloaded', 'success')
     }
 
+    const usageByPeriod = useMemo(() => {
+        const usage = {}
+        for (const row of schedule) {
+            const counts = usage[row.exam_period_id] ||= { major: 0, minor: 0 }
+            counts[row.capacity_pool || 'major'] += Number(row.student_count) || 0
+        }
+        return usage
+    }, [schedule])
+
     const stats = useMemo(() => {
         const total = periods.length
-        const capped = periods.filter(period => Number(period.student_cap) > 0).length
+        const capped = periods.filter(period => period.major_cap !== null || period.minor_cap !== null || period.subject_cap !== null).length
         const open = total - capped
         return { total, capped, open }
     }, [periods])
@@ -194,27 +216,20 @@ export default function Slots() {
                     </div>
                     <div className="slots-toolbar">
                         <div className="slots-cap-group">
-                            <input
-                                className="form-input"
-                                type="number"
-                                min="1"
-                                placeholder="Cap for all slots"
-                                value={allCap}
-                                onChange={e => setAllCap(e.target.value)}
-                            />
-                            <button className="btn btn-secondary" onClick={() => handleApplyCapToAll(false)}>Apply Cap To All</button>
-                            <button className="btn btn-secondary" onClick={() => handleApplyCapToAll(true)}>Clear To Open</button>
+                            <CapacityInputs value={selectedCaps} onChange={setSelectedCaps} fieldsToApply={fieldsToApply} onFieldsToApplyChange={setFieldsToApply} />
+                            <button className="btn btn-secondary" disabled={!selectedIds.length || !Object.values(fieldsToApply).some(Boolean)} onClick={() => handleApplySelectedCaps(false)}>Apply Limits To Selected ({selectedIds.length})</button>
+                            <button className="btn btn-secondary" disabled={!selectedIds.length || !Object.values(fieldsToApply).some(Boolean)} onClick={() => handleApplySelectedCaps(true)}>Clear Selected Limits</button>
                         </div>
                         <div className="slots-action-group">
                             <button className="btn btn-secondary" onClick={downloadTemplate}>{icons.download} <span>Template</span></button>
-                            <button className="btn btn-secondary" onClick={() => fileRef.current?.click()}>{icons.upload} <span>Import</span></button>
+                            <button className="btn btn-secondary" disabled={importing} onClick={() => fileRef.current?.click()}>{icons.upload} <span>{importing ? 'Importing…' : 'Import'}</span></button>
                             <button className="btn btn-primary" onClick={exportSlots}>{icons.download} <span>Export</span></button>
                         </div>
                         <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" onChange={handleImport} style={{ display: 'none' }} />
                     </div>
                 </div>
                 <div className="slots-hero-note">
-                    Dates are shown as <strong>YYYY/DD/MM</strong>. Empty cap means the slot stays open.
+                    Dates are shown as <strong>DD/MM/YYYY</strong>. Select slots using the checkboxes, choose which limits to update, then apply. Subjects use Major capacity first, then Minor as needed. Each subject must fit entirely in one pool and within the per-subject limit. Blank means unlimited; zero prevents student assignments.
                 </div>
                 <div className="slots-kpi-strip">
                     <div className="slots-kpi-card">
@@ -232,11 +247,21 @@ export default function Slots() {
                 </div>
             </div>
 
+            {importResult && (
+                <div className="card mb-lg" role="status">
+                    <div className="flex items-center justify-between">
+                        <strong>{slotImportFeedback(importResult).message}</strong>
+                        <button className="btn btn-ghost btn-sm" aria-label="Dismiss import results" onClick={() => setImportResult(null)}>{icons.close}</button>
+                    </div>
+                    {(importResult.errors || []).map((error, index) => <div className="text-sm" key={index} style={{ marginTop: 8 }}>{error}</div>)}
+                    {importResult.failed > (importResult.errors?.length || 0) && <p className="text-sm">Showing the first {importResult.errors.length} errors of {importResult.failed} rejected rows.</p>}
+                </div>
+            )}
             <div className="panel slots-panel">
                 <div className="panel-header slots-panel-header">
                     <div>
                         <h3 className="panel-title">Slot Register</h3>
-                        <p className="section-subtitle">Each row is a schedulable period. Leave cap empty to keep the slot open.</p>
+                        <p className="section-subtitle">Each row is a schedulable period. Assigned students / capacity are shown for each pool, chosen automatically.</p>
                     </div>
                     <div className="slots-register-meta">
                         <span className="slots-meta-pill">Sorted by date</span>
@@ -254,13 +279,13 @@ export default function Slots() {
                         <thead>
                             <tr>
                                 <th>
-                                    <input type="checkbox" checked={allSelected} onChange={toggleSelectAll} />
+                                    <input type="checkbox" aria-label="Select all slots" checked={allSelected} onChange={toggleSelectAll} />
                                 </th>
                                 <th>Date</th>
                                 <th>Start</th>
                                 <th>End</th>
                                 <th>Duration</th>
-                                <th>Cap</th>
+                                <th>Students / Caps</th>
                                 <th>Status</th>
                                 <th>Assigned</th>
                                 <th>Actions</th>
@@ -276,17 +301,18 @@ export default function Slots() {
                                             <td>
                                                 <input
                                                     type="checkbox"
+                                                    aria-label={`Select slot ${formatExamDateDisplay(period.exam_date)} ${period.start_time}`}
                                                     checked={selectedIds.includes(period.id)}
                                                     onChange={() => toggleRowSelection(period.id)}
                                                     disabled={isEditing}
                                                 />
                                             </td>
-                                            <td>{isEditing ? <input className="form-input" type="date" value={row.exam_date} onChange={e => setEditingRow({ ...row, exam_date: e.target.value })} /> : formatExamDateDisplay(period.exam_date)}</td>
+                                            <td>{isEditing ? <DateInput className="form-input"  value={row.exam_date} onChange={e => setEditingRow({ ...row, exam_date: e.target.value })} /> : formatExamDateDisplay(period.exam_date)}</td>
                                             <td>{isEditing ? <input className="form-input" type="time" value={row.start_time} onChange={e => setEditingRow({ ...row, start_time: e.target.value })} /> : period.start_time}</td>
                                             <td>{isEditing ? <input className="form-input" type="time" value={row.end_time} onChange={e => setEditingRow({ ...row, end_time: e.target.value })} /> : period.end_time}</td>
                                             <td><span className="slots-duration-pill">{durationText(row.start_time, row.end_time)}</span></td>
-                                            <td>{isEditing ? <input className="form-input" type="number" min="1" placeholder="Open" value={row.student_cap ?? ''} onChange={e => setEditingRow({ ...row, student_cap: e.target.value })} /> : (period.student_cap || <span className="text-muted">Open</span>)}</td>
-                                            <td><span className={`badge ${period.student_cap ? 'badge-scheduled' : 'badge-unscheduled'}`}>{period.student_cap ? 'Capped' : 'Open'}</span></td>
+                                            <td>{isEditing ? <CapacityInputs value={row} onChange={setEditingRow} /> : <CapacitySummary value={period} usage={usageByPeriod[period.id] || { major: 0, minor: 0 }} />}</td>
+                                            <td><span className="badge badge-scheduled">{period.major_cap !== null || period.minor_cap !== null || period.subject_cap !== null ? 'Capped' : 'Open'}</span></td>
                                             <td><span className="slots-assigned-count">{assignedCount}</span></td>
                                             <td>
                                                 <div className="slots-row-actions">
@@ -297,7 +323,7 @@ export default function Slots() {
                                                         </>
                                                     ) : (
                                                         <>
-                                                            <button className="btn btn-ghost btn-sm" onClick={() => { setEditingId(period.id); setEditingRow({ ...period, student_cap: period.student_cap ?? '' }) }}>{icons.audit}</button>
+                                                            <button className="btn btn-ghost btn-sm" onClick={() => { setEditingId(period.id); setEditingRow({ ...period }) }}>{icons.audit}</button>
                                                             <button className="btn btn-ghost btn-sm" onClick={() => handleDeleteRow(period.id)}>{icons.trash}</button>
                                                         </>
                                                     )}
@@ -308,12 +334,12 @@ export default function Slots() {
                                 })}
                             <tr className="slots-new-row">
                                 <td></td>
-                                <td><input className="form-input" type="date" value={newRow.exam_date} onChange={e => setNewRow({ ...newRow, exam_date: e.target.value })} /></td>
+                                <td><DateInput className="form-input"  value={newRow.exam_date} onChange={e => setNewRow({ ...newRow, exam_date: e.target.value })} /></td>
                                 <td><input className="form-input" type="time" value={newRow.start_time} onChange={e => setNewRow({ ...newRow, start_time: e.target.value })} /></td>
                                 <td><input className="form-input" type="time" value={newRow.end_time} onChange={e => setNewRow({ ...newRow, end_time: e.target.value })} /></td>
                                 <td><span className="slots-duration-pill">{durationText(newRow.start_time, newRow.end_time)}</span></td>
-                                <td><input className="form-input" type="number" min="1" placeholder="Open" value={newRow.student_cap} onChange={e => setNewRow({ ...newRow, student_cap: e.target.value })} /></td>
-                                <td><span className={`badge ${newRow.student_cap ? 'badge-scheduled' : 'badge-unscheduled'}`}>{newRow.student_cap ? 'Capped' : 'Open'}</span></td>
+                                <td><CapacityInputs value={newRow} onChange={setNewRow} /></td>
+                                <td><span className="badge badge-unscheduled">New</span></td>
                                 <td><span className="slots-assigned-count">-</span></td>
                                 <td><button className="btn btn-primary btn-sm" onClick={handleAddRow}>{icons.plus} Add</button></td>
                             </tr>

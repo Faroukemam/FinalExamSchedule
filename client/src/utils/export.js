@@ -27,9 +27,11 @@ export async function downloadExcelFromBackend(filename, sheetName, data) {
                 document.body.removeChild(a);
             }
         }, 100);
+        return true;
     } catch (err) {
         console.error("Export error:", err);
         alert("Export failed: " + err.message);
+        return false;
     }
 }
 
@@ -56,9 +58,11 @@ export async function downloadMultiSheetExcelFromBackend(filename, sheets) {
                 document.body.removeChild(a);
             }
         }, 100);
+        return true;
     } catch (err) {
         console.error("Export error:", err);
         alert("Export failed: " + err.message);
+        return false;
     }
 }
 
@@ -85,8 +89,10 @@ export async function downloadWordFromBackend(filename, html) {
                 document.body.removeChild(a);
             }
         }, 100);
+        return true;
     } catch (err) {
         console.error("Export error:", err);
         alert("Export failed: " + err.message);
+        return false;
     }
 }

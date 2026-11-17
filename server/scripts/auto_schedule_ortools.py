@@ -112,18 +112,20 @@ def solve(payload):
     ordered_dates = sorted({str(period["exam_date"]) for period in periods})
     day_rank_by_date = {exam_date: index for index, exam_date in enumerate(ordered_dates)}
 
-    def normalized_cap(period):
-        raw = period.get("student_cap")
+    def normalized_cap(period, capacity_type):
+        raw = period.get(f"{capacity_type}_cap")
         if raw in (None, ""):
             return None
         cap = int(raw)
-        return cap if cap > 0 else None
+        return cap if cap >= 0 else None
 
     shared_counts = build_shared_counts(registrations)
 
     existing_students_by_period = defaultdict(int)
+    existing_subjects_by_period = defaultdict(lambda: defaultdict(int))
     for row in current_schedule:
         existing_students_by_period[int(row["period_id"])] += int(row.get("student_count") or 0)
+        existing_subjects_by_period[int(row["period_id"])][str(row["subject_code"])] += int(row.get("student_count") or 0)
 
     current_students_by_period_subject = {}
     for row in current_schedule:
@@ -146,6 +148,7 @@ def solve(payload):
                 "subject_codes": [str(code) for code in unit.get("subject_codes", [])],
                 "required_duration": int(unit.get("required_duration") or 120),
                 "student_count": int(unit.get("student_count") or 0),
+                "subject_counts": unit["subject_counts"],
                 "eligible_period_ids": [int(period_id) for period_id in unit.get("eligible_period_ids", [])],
                 "enrolled_students": [str(student_id) for student_id in unit.get("enrolled_students", [])],
             })
@@ -169,6 +172,7 @@ def solve(payload):
                 "subject_codes": [subject_code],
                 "required_duration": required_duration,
                 "student_count": int(subject.get("student_count") or 0),
+                "subject_counts": {subject_code: int(subject.get("student_count") or 0)},
                 "eligible_period_ids": eligible,
                 "enrolled_students": [],
             })
@@ -206,28 +210,33 @@ def solve(payload):
         model.Add(sum(vars_for_day) <= max_new)
 
     for period in periods:
-        cap = normalized_cap(period)
-        if cap is None:
-            continue
         period_id = int(period["id"])
-        existing_students = existing_students_by_period.get(period_id, 0)
-        eligible_vars = [
-            subject["student_count"] * x[(subject["unit_id"], period_id)]
-            for subject in schedulable
-            if (subject["unit_id"], period_id) in x
-        ]
-        if eligible_vars:
-            max_allowed = int(cap)
-            if existing_students >= max_allowed:
-                for subject in schedulable:
-                    if (subject["unit_id"], period_id) in x:
-                        model.Add(x[(subject["unit_id"], period_id)] == 0)
+        period_vars = [x[(unit["unit_id"], period_id)] for unit in schedulable if (unit["unit_id"], period_id) in x]
+        if not period_vars:
+            continue
+        active = model.NewBoolVar(f"active_{period_id}")
+        model.Add(sum(period_vars) >= 1).OnlyEnforceIf(active)
+        model.Add(sum(period_vars) == 0).OnlyEnforceIf(active.Not())
+        loads = {"major": [], "minor": []}
+        # Existing subjects may switch pools, but stay in their current period.
+        for code, count in existing_subjects_by_period[period_id].items():
+            major = model.NewBoolVar(f"fixed_major_{period_id}_{code}")
+            loads["major"].append(count * major)
+            loads["minor"].append(count * (1 - major))
+        for unit in schedulable:
+            selected = x.get((unit["unit_id"], period_id))
+            if selected is None:
                 continue
-            model.Add(existing_students + sum(eligible_vars) <= max_allowed)
-            max_possible = existing_students + sum(subject["student_count"] for subject in schedulable if (subject["unit_id"], period_id) in x)
-            overflow = model.NewIntVar(0, max_possible, f"overflow_{period_id}")
-            model.Add(existing_students + sum(eligible_vars) - cap <= overflow)
-            objective_terms["capacity_overflow"].append(overflow)
+            for code, count in unit["subject_counts"].items():
+                major = model.NewBoolVar(f"major_{unit['unit_id']}_{period_id}_{code}")
+                minor = model.NewBoolVar(f"minor_{unit['unit_id']}_{period_id}_{code}")
+                model.Add(major + minor == selected)
+                loads["major"].append(int(count) * major)
+                loads["minor"].append(int(count) * minor)
+        for pool in ("major", "minor"):
+            cap = normalized_cap(period, pool)
+            if cap is not None:
+                model.Add(sum(loads[pool]) <= cap).OnlyEnforceIf(active)
 
     for subject in schedulable:
         subject_codes = subject["subject_codes"]
